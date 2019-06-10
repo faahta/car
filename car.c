@@ -7,8 +7,8 @@
 #include<stdbool.h>
 #include<errno.h>
 
-#define C_QUEUE_MAX 20
-#define N_CAR_MAX 1000
+#define C_QUEUE_MAX 100
+#define N_CAR_MAX 200
 
 enum FUEL_TYPE{PETROL, DIESEL};
 
@@ -17,6 +17,7 @@ typedef struct CarQueue{
 	int capacity;
 	int *cars;
 	pthread_mutex_t q_lock;
+	sem_t *empty, *full;
 }CarQueue;
 
 typedef struct Car{
@@ -36,22 +37,27 @@ sem_t *p_sem;
 int narrivals, interval, service;
 int tot_arrivals;
 
-int isFull(CarQueue *c_queue){ return (c_queue->size == c_queue->capacity); }
-int isEmpty(CarQueue *c_queue){ return (c_queue->size == 0); }
-
-void enqueue_car(CarQueue *c_queue, int car_id){
-	if(isFull(c_queue)){ return; }
+void put(CarQueue *c_queue, int car_id){
+	sem_wait(c_queue->empty);
 	c_queue->rear = (c_queue->rear + 1 )% c_queue->capacity;
 	c_queue->cars[c_queue->rear] = car_id;
 	c_queue->size += 1;
+	sem_post(c_queue->full);
 }
 
-int dequeue_car(CarQueue *c_queue){
-	if(isEmpty(c_queue)){ return -1; }
+int get(CarQueue *queue1, CarQueue *queue2){
 	int car_id;
-	c_queue->front = (c_queue->front + 1)% c_queue->capacity;
-	car_id = c_queue->cars[c_queue->front];
-	c_queue->size -= 1;
+	if(sem_trywait(queue1->full) == 0){
+		queue1->front = (queue1->front + 1)% queue1->capacity;
+		car_id = queue1->cars[queue1->front];
+		queue1->size -= 1;
+		sem_post(queue1->empty);	
+	} else{
+		queue2->front = (queue2->front + 1)% queue2->capacity;
+		car_id = queue2->cars[queue2->front];
+		queue2->size -= 1;
+		sem_post(queue2->empty);	
+	}
 	return car_id;	
 }
 
@@ -73,7 +79,6 @@ void print_queues(){
 static void * thread_checkout(void * arg){
 	pthread_detach(pthread_self());
 	while(1){
-		sem_wait(p_sem);
 		Car c;
 		int res = read(pipe_fd[0], &c, sizeof(c));
 		if(res != 1){ perror("pipe read(): "); }
@@ -106,63 +111,32 @@ static void * thread_pump(void * arg){
 		srand(time(NULL));
 		if(pid <= 4){
 			pthread_mutex_lock(&c_queue1->q_lock);
-				c_id1 = dequeue_car(c_queue1);				
-				if(c_id1 != -1){
-					serv_time = ((rand() % service) + 1);
-					//fprintf(stdout,"pump %d serving car %d from queue 1\n", pid, c_id1);
-					sleep(serv_time);
-					
-					car[c_id1].serv_time = serv_time;
-					car[c_id1].q_num = 1;
-					int res = write(pipe_fd[1], &car[c_id1], sizeof(car[c_id1]));
-					sem_post(p_sem);
-				} else{
-					c_id1 = dequeue_car(c_queue2);
-					if(c_id1 != -1){
-						serv_time = ((rand() % service) + 1);
-						fprintf(stdout,"pump %d serving car %d FROM QUEUE 2\n", pid, c_id1);
-						sleep(serv_time);
-						
-						car[c_id1].serv_time = serv_time;
-						car[c_id1].q_num = 2;
-						int res = write(pipe_fd[1], &car[c_id1], sizeof(car[c_id1]));
-						sem_post(p_sem);
-					} else { continue; }
-				}
+				c_id1 = get(c_queue1, c_queue2);				
+				serv_time = ((rand() % service) + 1);
+				//fprintf(stdout,"pump %d serving car %d from queue 1\n", pid, c_id1);
+				sleep(serv_time);	
+				car[c_id1].serv_time = serv_time;
+				car[c_id1].q_num = 1;
+				int res = write(pipe_fd[1], &car[c_id1], sizeof(car[c_id1]));
 			pthread_mutex_unlock(&c_queue1->q_lock);
 		}
+		
 		
 		/*pump 5 - pump8*/
 		if(pid > 4){
 			pthread_mutex_lock(&c_queue2->q_lock);
-				c_id2 = dequeue_car(c_queue2);			
-				if(c_id2 != -1){
-					serv_time = ((rand() % service) + 1);
-					//fprintf(stdout,"pump %d serving car %d frome queue 2\n", pid, c_id2);
-					sleep(serv_time);
-					
-					car[c_id2].serv_time = serv_time;
-					car[c_id2].q_num = 2;
-					int res = write(pipe_fd[1], &car[c_id2], sizeof(car[c_id2]));
-					sem_post(p_sem);
-				} else{
-					c_id2 = dequeue_car(c_queue1);
-					if(c_id2 != -1){
-						serv_time = ((rand() % service) + 1);
-						fprintf(stdout,"pump %d serving car %d FROM QUEUE 1\n", pid, c_id2);
-						sleep(serv_time);
-						
-						car[c_id2].serv_time = serv_time;
-						car[c_id2].q_num = 1;
-						int res = write(pipe_fd[1], &car[c_id2], sizeof(car[c_id2]));
-						sem_post(p_sem);
-					} else { continue; }
-				}
+				c_id2 = get(c_queue2, c_queue1);			
+				serv_time = ((rand() % service) + 1);
+				sleep(serv_time);
+				
+				car[c_id2].serv_time = serv_time;
+				car[c_id2].q_num = 2;
+				int res = write(pipe_fd[1], &car[c_id2], sizeof(car[c_id2]));			
 			pthread_mutex_unlock(&c_queue2->q_lock);
 		}
 		
 	}
-	
+	pthread_exit((void *)pthread_self());
 }
 
 static void * thread_car(void * arg){
@@ -181,12 +155,12 @@ static void * thread_car(void * arg){
 	srand(time(NULL));
 	int q = ((rand() % 2) + 1);
 	if(q == 1){
-		enqueue_car(c_queue1, id);
+		put(c_queue1, id);
 		//printf("car %d waiting on queue 1\n",id);
 		sem_wait(car[id].q_sem);		
 	} 
 	if(q == 2){
-		enqueue_car(c_queue2, id);
+		put(c_queue2, id);
 		//printf("car %d waiting on queue 2\n",id);
 		sem_wait(car[id].q_sem);
 		
@@ -211,6 +185,13 @@ void init(){
 	c_queue1->rear = C_QUEUE_MAX - 1;
 	c_queue1->capacity = C_QUEUE_MAX;
 	c_queue1->cars = (int *)malloc(C_QUEUE_MAX * sizeof(int));
+	
+	c_queue1->empty = (sem_t *)malloc(sizeof(sem_t));
+	sem_init(c_queue1->empty, 0, C_QUEUE_MAX);
+	
+	c_queue1->full = (sem_t *)malloc(sizeof(sem_t));
+	sem_init(c_queue1->full, 0, 0);
+	
 	pthread_mutex_init(&c_queue1->q_lock, NULL);
 	
 	/*init car queue2*/
@@ -218,6 +199,13 @@ void init(){
 	c_queue2->rear = C_QUEUE_MAX - 1;
 	c_queue2->capacity = C_QUEUE_MAX;
 	c_queue2->cars = (int *)malloc(C_QUEUE_MAX * sizeof(int));
+	
+	c_queue2->empty = (sem_t *)malloc(sizeof(sem_t));
+	sem_init(c_queue2->empty, 0, C_QUEUE_MAX);
+	
+	c_queue2->full = (sem_t *)malloc(sizeof(sem_t));
+	sem_init(c_queue2->full, 0, 0);
+	
 	pthread_mutex_init(&c_queue2->q_lock, NULL);
 	
 	
@@ -226,9 +214,7 @@ void init(){
 	if(res < 0){
 		perror("pipe");
 		exit(1);
-	}
-	p_sem = (sem_t *)malloc(sizeof(sem_t));
-	sem_init(p_sem, 0, 0);	
+	}	
 }
 
 
@@ -258,7 +244,7 @@ int main(int argc, char *argv[]){
 	/*create car threads with interval*/
 	th_car = (pthread_t *)malloc(N_CAR_MAX * sizeof(pthread_t));
 	int id = 0, j=0;
-	while(j<=N_CAR_MAX){	
+	while(j<=N_CAR_MAX){
 		sleep((rand() % interval) + 1);	
 		
 		for(i=id+1; i <= narrivals+id; i++){				 
